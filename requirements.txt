@@ -1,0 +1,30 @@
+# Core dependencies
+playwright>=1.40.0
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+
+# Vector DB and embeddings
+chromadb>=0.4.20
+sentence-transformers>=2.3.0
+
+# LLM clients
+anthropic>=0.14.0
+
+# Image processing
+Pillow>=10.1.0
+
+# Utilities
+tenacity>=8.2.3  # Retry logic
+structlog>=24.1.0  # Structured logging
+PyYAML>=6.0.1  # Config files
+
+# Testing
+pytest>=7.4.3
+pytest-asyncio>=0.21.1
+pytest-mock>=3.12.0
+pytest-cov>=4.1.0
+
+# Development
+black>=23.12.0  # Code formatting
+ruff>=0.1.8  # Linting
+mypy>=1.7.1  # Type checking
