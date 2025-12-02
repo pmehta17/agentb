@@ -125,6 +125,10 @@ Generate the plan:
                 "plan_generated",
                 task=task,
                 steps=len(steps),
+                step_list=[
+                    f"Step {s.step}: {s.action.value} - {s.target_description}"
+                    for s in steps
+                ]
             )
 
             return plan
@@ -134,7 +138,7 @@ Generate the plan:
             raise
 
     async def regenerate_plan(self, context: ContextBundle) -> Plan:
-        """Regenerate plan using failure context.
+        """Regenerate plan using failure context with visual awareness.
 
         Args:
             context: Bundle containing goal, history, failure info, and screenshot
@@ -148,25 +152,50 @@ Generate the plan:
             for s in context.plan_history
         )
 
+        # Determine if we should continue from current state or restart
+        has_progress = len(context.plan_history) > 0
+
+        if has_progress:
+            continuation_guidance = f"""
+CRITICAL: The steps listed above were ALREADY COMPLETED SUCCESSFULLY.
+DO NOT repeat these steps. DO NOT navigate away from the current page/state.
+The screenshot shows the CURRENT state AFTER those successful steps.
+
+Your job is to CONTINUE from this point forward to complete the goal.
+- If a modal/dialog is open, work within it
+- If you're already on the target page, don't navigate again
+- Start your plan from where the previous plan left off"""
+        else:
+            continuation_guidance = """
+This is the first attempt. Generate a complete plan from the beginning."""
+
         prompt = f"""You are an expert at planning browser automation tasks. A previous plan failed and needs correction.
 
 Original Goal: {context.goal}
 
 Steps Executed Successfully:
 {executed_steps if context.plan_history else "  (none)"}
+{continuation_guidance}
 
 Failed Step:
   Step {context.failure.step.step}: {context.failure.step.action.value} on '{context.failure.step.target_description}'
   Error Type: {context.failure.error_type}
   Error Message: {context.failure.error_message}
 
-Analyze what went wrong and generate a COMPLETE corrected plan from the beginning.
+IMPORTANT: You are provided with a screenshot showing the CURRENT state of the browser.
+Analyze this screenshot carefully to understand:
+1. What UI elements are currently visible
+2. What state the application is in (modal open, page loaded, etc.)
+3. Why the failed step couldn't find its target element
+4. What the next logical steps should be given what's ACTUALLY on screen
 
 Requirements:
-1. Consider why the original step failed
-2. The plan should start from the current state (after successful steps)
-3. May need to add prerequisite steps or modify the approach
+1. Consider why the original step failed based on what you see
+2. The plan should CONTINUE from the current state (preserve progress!)
+3. Do NOT restart or re-navigate unless absolutely necessary
 4. Use ONLY these action types: CLICK, TYPE, SELECT, NAVIGATE
+5. Base your plan on what's VISIBLE in the screenshot, not assumptions
+6. If elements from completed steps are visible (open modals, etc), work within them
 
 Output Format:
 Return ONLY a JSON array of steps following this schema:
@@ -176,16 +205,38 @@ Important:
 - value is required for TYPE (text to type), SELECT (option to select), and NAVIGATE (URL to navigate to). null for CLICK actions.
 - For NAVIGATE actions, value must be a complete URL (e.g., "https://notion.so" or "https://google.com")
 - target_description should be specific enough to uniquely identify the element
+- PRESERVE PROGRESS: Only use NAVIGATE if the current screen shows you're not on the right page
+- If a modal/dialog is open (visible in screenshot), continue working in it
 
-Generate the corrected plan:
+Generate the corrected continuation plan based on what you SEE in the screenshot:
 """
 
         try:
+            # Encode screenshot for vision model
+            image_base64 = base64.standard_b64encode(context.current_screenshot).decode("utf-8")
+
+            # Use vision-capable model for re-planning
             response = self.client.messages.create(
                 model=self.config.planner_model,
                 max_tokens=2048,
                 messages=[
-                    {"role": "user", "content": prompt}
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": image_base64,
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                        ],
+                    }
                 ],
             )
 
@@ -194,7 +245,7 @@ Generate the corrected plan:
 
             plan = Plan(task=context.goal, steps=steps)
             logger.info(
-                "plan_regenerated",
+                "plan_regenerated_with_vision",
                 task=context.goal,
                 steps=len(steps),
                 failed_step=context.failure.step.step,

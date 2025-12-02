@@ -74,20 +74,45 @@ class Orchestrator:
         plan = self.skills_library.find_skill(task)
 
         if plan:
-            logger.info("skill_cache_hit", task=task)
-        else:
-            # Step 2: Detect authentication status if storage_state is provided
-            is_authenticated = False
-            if self.config.storage_state:
-                logger.info("checking_authentication_status")
-                is_authenticated = await self._detect_authenticated_state()
-                if is_authenticated:
-                    logger.info("authenticated_state_detected",
-                               reason="workspace_ui_detected")
+            logger.info(
+                "skill_cache_hit",
+                task=task,
+                steps=len(plan.steps),
+                step_list=[
+                    f"Step {s.step}: {s.action.value} - {s.target_description}"
+                    for s in plan.steps
+                ]
+            )
 
-            # Step 3: Generate initial plan with current URL context and auth status
+            # Check if we're on a blank page with a cached plan
+            current_url = self.executor.get_current_url()
+            if current_url == "about:blank":
+                # Infer target URL from task
+                target_url = self._infer_url_from_task(task)
+                if target_url:
+                    logger.info(
+                        "auto_navigating_cached_skill",
+                        target_url=target_url,
+                        reason="cached_plan_on_blank_page"
+                    )
+                    await self.executor.navigate(target_url)
+                    # Wait for page to load
+                    await self.state_capturer.wait_for_change(timeout=5.0)
+                else:
+                    logger.warning(
+                        "cannot_infer_url",
+                        task=task,
+                        message="Cached plan on blank page but couldn't infer URL"
+                    )
+        else:
+            # Step 2: Generate initial plan with current URL context
+            # Authentication is handled externally via storage_state from login.py
             logger.info("skill_cache_miss", task=task)
             current_url = self.executor.get_current_url()
+
+            # Assume authenticated if storage_state is provided
+            is_authenticated = self.config.storage_state is not None
+
             plan = await self.planner.generate_initial_plan(
                 task,
                 current_url=current_url,
@@ -253,6 +278,16 @@ class Orchestrator:
         Returns:
             Coordinates if found, None otherwise
         """
+        # Guard: Skip element search on blank pages
+        current_url = self.executor.get_current_url()
+        if current_url == "about:blank":
+            logger.warning(
+                "element_search_skipped_blank_page",
+                target=step.target_description,
+                message="Cannot search for elements on blank page"
+            )
+            return None
+
         # DOM-first: Try to find by text
         coords = await self.executor.find_element_by_text(step.target_description)
 
@@ -341,9 +376,15 @@ class Orchestrator:
 
         try:
             new_plan = await self.planner.regenerate_plan(context)
+            # Planner already logged plan_regenerated_with_vision
+            # Just add step_list for CLI display
             logger.info(
-                "replan_generated",
+                "replan_ready",
                 new_steps=len(new_plan.steps),
+                step_list=[
+                    f"Step {s.step}: {s.action.value} - {s.target_description}"
+                    for s in new_plan.steps
+                ]
             )
             return new_plan
         except Exception as e:
@@ -358,52 +399,38 @@ class Orchestrator:
         """
         await self.executor.navigate(url)
 
-    async def _detect_authenticated_state(self) -> bool:
-        """Detect if user is already authenticated by checking for workspace UI.
+    def _infer_url_from_task(self, task: str) -> str | None:
+        """Infer starting URL from task description.
+
+        Args:
+            task: Task description
 
         Returns:
-            True if authenticated workspace UI is detected, False otherwise
+            URL string or None if cannot infer
         """
-        try:
-            screenshot = await self.state_capturer.get_screenshot()
+        task_lower = task.lower()
 
-            # Use perceptor to check for authenticated workspace indicators
-            from agentb.core.types import PlanStep
+        # Common service mappings
+        url_mappings = {
+            "notion": "https://www.notion.so",
+            "github": "https://github.com",
+            "google": "https://www.google.com",
+            "youtube": "https://www.youtube.com",
+            "gmail": "https://mail.google.com",
+            "twitter": "https://twitter.com",
+            "linkedin": "https://www.linkedin.com",
+            "slack": "https://slack.com",
+            "trello": "https://trello.com",
+            "asana": "https://app.asana.com",
+        }
 
-            # Create a dummy step to check for workspace UI elements
-            check_step = PlanStep(
-                step=0,
-                action=ActionType.CLICK,  # Dummy action, won't be used
-                target_description="workspace sidebar or user profile menu or workspace name",
-                value=None,
-                semantic_role="primary_action",
-                required_state="authenticated_workspace",
-            )
+        # Check for each service name in task
+        for service, url in url_mappings.items():
+            if service in task_lower:
+                return url
 
-            result = await self.perceptor.find_element(screenshot, check_step)
-
-            # If coordinates returned, workspace UI was found
-            if isinstance(result, Coordinates):
-                return True
-            else:
-                # Check the failure message for authenticated state indicators
-                if isinstance(result, FailureInfo):
-                    message = result.error_message.lower()
-                    # Look for indicators that user is already logged in
-                    authenticated_indicators = [
-                        "already logged in",
-                        "workspace",
-                        "authenticated",
-                        "user is logged in",
-                        "dashboard",
-                    ]
-                    if any(indicator in message for indicator in authenticated_indicators):
-                        return True
-                return False
-        except Exception as e:
-            logger.debug("authentication_check_failed", error=str(e))
-            # If check fails, assume not authenticated to be safe
-            return False
+        # If no match found, return None
+        return None
 
     @property
     def current_plan(self) -> Plan | None:

@@ -39,18 +39,25 @@ def add_cli_status_messages(
     status_messages = {
         "skill_cache_hit": "✨ Found cached workflow - using previous successful approach",
         "skill_cache_miss": "🧠 Generating new plan for this task",
-        "checking_authentication_status": "🔍 Checking if already logged in...",
-        "authenticated_state_detected": "🔐 Authenticated session detected - skipping login steps",
-        "executing_step": lambda d: f"🔄 Step {d.get('step', '?')}: {d.get('action', '?')} - {d.get('target', '?')}",
+        "plan_generated": lambda d: f"📋 Plan created with {d.get('steps', '?')} steps",
+        "executing_step": lambda d: f"\n🔄 Step {d.get('step', '?')}: {d.get('action', '?')} - {d.get('target', '?')}",
         "step_completed": lambda d: f"✅ Step {d.get('step', '?')} completed",
         "navigation_skipped": lambda d: f"⏭️  Skipped navigation - already on {urlparse(d.get('current_url', '')).netloc if 'current_url' in d else 'target site'}",
         "login_step_skipped": lambda d: f"⏭️  Skipped login step - using saved session",
-        "dom_search_failed_trying_vision": "👁️  Using vision to locate element",
-        "vision_search_failed": "⚠️  Could not locate element",
+        "dom_search_failed_trying_vision": "   👁️  Using vision to locate element...",
+        "vision_search_failed": "   ⚠️  Could not locate element",
         "action_failed": lambda d: f"❌ Action failed: {d.get('error', 'Unknown error')}",
         "max_replans_reached": "❌ Maximum retry attempts reached",
+        "replanning": lambda d: f"🔄 Re-planning with vision (attempt {d.get('attempt', '?')})...",
+        "replan_generated": lambda d: f"📋 New plan generated with {d.get('new_steps', '?')} steps",
+        "plan_regenerated_with_vision": lambda d: f"👁️ Vision-guided plan: {d.get('steps', '?')} continuation steps",
         "skill_saved": "💾 Workflow saved for future reuse",
         "task_validation_failed": "⚠️  Task validation failed",
+        "screenshot_skipped_blank_page": lambda d: f"⚠️  Skipped screenshot - page is blank (step: {d.get('step_name', '?')})",
+        "screenshot_from_blank_page": "⚠️  Warning: Taking screenshot from blank page",
+        "auto_navigating_cached_skill": lambda d: f"🧭 Auto-navigating to {d.get('target_url', '?')} for cached skill",
+        "element_search_skipped_blank_page": "⚠️  Skipped element search - page is blank",
+        "vision_response_invalid_retrying": lambda d: f"   ⚠️  Vision response invalid, retrying (attempt {d.get('attempt', '?')})...",
     }
 
     if event in status_messages:
@@ -60,6 +67,34 @@ def add_cli_status_messages(
         else:
             status = msg
         print(status, flush=True)
+
+        # Print step list if plan was generated
+        if event == "plan_generated" and "step_list" in event_dict:
+            print("\n📝 Plan steps:")
+            for step_desc in event_dict["step_list"]:
+                print(f"   {step_desc}")
+            print()  # Extra newline for readability
+
+        # Print step list if cached skill was found
+        if event == "skill_cache_hit" and "step_list" in event_dict:
+            print("\n📝 Cached plan steps:")
+            for step_desc in event_dict["step_list"]:
+                print(f"   {step_desc}")
+            print()  # Extra newline for readability
+
+        # Print new step list if plan was regenerated
+        if event == "replan_generated" and "step_list" in event_dict:
+            print("\n📝 Updated plan steps:")
+            for step_desc in event_dict["step_list"]:
+                print(f"   {step_desc}")
+            print()  # Extra newline for readability
+
+        # Print new step list if plan was regenerated with vision
+        if event == "plan_regenerated_with_vision" and "step_list" in event_dict:
+            print("\n📝 Vision-guided continuation steps:")
+            for step_desc in event_dict["step_list"]:
+                print(f"   {step_desc}")
+            print()  # Extra newline for readability
 
     return event_dict
 
