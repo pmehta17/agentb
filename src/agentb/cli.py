@@ -40,8 +40,11 @@ def add_cli_status_messages(
         "skill_cache_hit": "✨ Found cached workflow - using previous successful approach",
         "skill_cache_miss": "🧠 Generating new plan for this task",
         "plan_generated": lambda d: f"📋 Plan created with {d.get('steps', '?')} steps",
+        "vision_plan_generated": lambda d: f"👁️ Vision-based plan created with {d.get('steps', '?')} steps",
+        "vision_planning_enabled": "📸 Using screenshot for vision-based planning",
         "executing_step": lambda d: f"\n🔄 Step {d.get('step', '?')}: {d.get('action', '?')} - {d.get('target', '?')}",
         "step_completed": lambda d: f"✅ Step {d.get('step', '?')} completed",
+        "step_skipped_blank_page": lambda d: f"⏭️  Skipped step {d.get('step', '?')} - page is blank",
         "navigation_skipped": lambda d: f"⏭️  Skipped navigation - already on {urlparse(d.get('current_url', '')).netloc if 'current_url' in d else 'target site'}",
         "login_step_skipped": lambda d: f"⏭️  Skipped login step - using saved session",
         "dom_search_failed_trying_vision": "   👁️  Using vision to locate element...",
@@ -52,10 +55,13 @@ def add_cli_status_messages(
         "replan_generated": lambda d: f"📋 New plan generated with {d.get('new_steps', '?')} steps",
         "plan_regenerated_with_vision": lambda d: f"👁️ Vision-guided plan: {d.get('steps', '?')} continuation steps",
         "skill_saved": "💾 Workflow saved for future reuse",
+        "skill_updated": "🔄 Cached workflow updated with successful execution path",
+        "updating_cached_skill": lambda d: f"📝 Updating skill: {d.get('old_steps', '?')} steps → {d.get('new_steps', '?')} steps",
         "task_validation_failed": "⚠️  Task validation failed",
         "screenshot_skipped_blank_page": lambda d: f"⚠️  Skipped screenshot - page is blank (step: {d.get('step_name', '?')})",
         "screenshot_from_blank_page": "⚠️  Warning: Taking screenshot from blank page",
         "auto_navigating_cached_skill": lambda d: f"🧭 Auto-navigating to {d.get('target_url', '?')} for cached skill",
+        "auto_navigating_cache_miss": lambda d: f"🧭 Auto-navigating to {d.get('target_url', '?')} before planning",
         "element_search_skipped_blank_page": "⚠️  Skipped element search - page is blank",
         "vision_response_invalid_retrying": lambda d: f"   ⚠️  Vision response invalid, retrying (attempt {d.get('attempt', '?')})...",
     }
@@ -71,6 +77,13 @@ def add_cli_status_messages(
         # Print step list if plan was generated
         if event == "plan_generated" and "step_list" in event_dict:
             print("\n📝 Plan steps:")
+            for step_desc in event_dict["step_list"]:
+                print(f"   {step_desc}")
+            print()  # Extra newline for readability
+
+        # Print step list if vision plan was generated
+        if event == "vision_plan_generated" and "step_list" in event_dict:
+            print("\n📝 Vision-based plan steps:")
             for step_desc in event_dict["step_list"]:
                 print(f"   {step_desc}")
             print()  # Extra newline for readability

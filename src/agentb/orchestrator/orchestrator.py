@@ -1,5 +1,6 @@
 """Orchestrator - Central nervous system for planning, execution, and error recovery."""
 
+import asyncio
 import structlog
 
 from agentb.core.config import Config
@@ -10,6 +11,8 @@ from agentb.core.types import (
     FailureInfo,
     Plan,
     PlanStep,
+    SemanticRole,
+    STATE_CHANGE_TIMEOUTS,
 )
 from agentb.executor import Executor
 from agentb.perceptor import Perceptor
@@ -96,8 +99,18 @@ class Orchestrator:
                         reason="cached_plan_on_blank_page"
                     )
                     await self.executor.navigate(target_url)
-                    # Wait for page to load
-                    await self.state_capturer.wait_for_change(timeout=5.0)
+                    # Smarter wait for authenticated sessions
+                    if self.config.storage_state:
+                        # Authenticated session - just wait for DOM ready, not visual change
+                        # This is much faster since the session loads instantly
+                        await self.executor.page.wait_for_load_state("domcontentloaded")
+                        logger.debug(
+                            "navigation_fast_wait_authenticated",
+                            reason="storage_state_provided"
+                        )
+                    else:
+                        # Wait for full page load with visual change detection
+                        await self.state_capturer.wait_for_change(timeout=5.0)
                 else:
                     logger.warning(
                         "cannot_infer_url",
@@ -110,11 +123,49 @@ class Orchestrator:
             logger.info("skill_cache_miss", task=task)
             current_url = self.executor.get_current_url()
 
+            # Auto-navigate if on blank page (same as cache hit logic)
+            if current_url == "about:blank":
+                target_url = self._infer_url_from_task(task)
+                if target_url:
+                    logger.info(
+                        "auto_navigating_cache_miss",
+                        target_url=target_url,
+                        reason="blank_page_before_planning"
+                    )
+                    await self.executor.navigate(target_url)
+                    # Smarter wait for authenticated sessions
+                    if self.config.storage_state:
+                        await self.executor.page.wait_for_load_state("domcontentloaded")
+                        logger.debug(
+                            "navigation_fast_wait_authenticated",
+                            reason="storage_state_provided"
+                        )
+                    else:
+                        await self.state_capturer.wait_for_change(timeout=5.0)
+                    # Update current_url after navigation
+                    current_url = self.executor.get_current_url()
+                else:
+                    logger.warning(
+                        "cannot_infer_url",
+                        task=task,
+                        message="Cache miss on blank page but couldn't infer URL"
+                    )
+
             # Assume authenticated if storage_state is provided
             is_authenticated = self.config.storage_state is not None
 
+            # Capture screenshot for vision-based planning (if not on blank page)
+            screenshot = None
+            if current_url != "about:blank":
+                screenshot = await self.state_capturer.get_screenshot()
+                logger.info(
+                    "vision_planning_enabled",
+                    reason="screenshot_captured_for_planning"
+                )
+
             plan = await self.planner.generate_initial_plan(
                 task,
+                screenshot=screenshot,
                 current_url=current_url,
                 is_authenticated=is_authenticated
             )
@@ -132,10 +183,48 @@ class Orchestrator:
         is_valid = await self.planner.validate_success(task, screenshot)
 
         if is_valid:
-            # Step 5: Save new skill (if not from cache)
-            if not self.skills_library.find_skill(task):
-                self.skills_library.add_skill(task, plan)
-                logger.info("skill_saved", task=task)
+            # Step 5: Save/update skill with ACTUAL successful execution path
+            # Build a plan from the steps that actually succeeded
+            if self._executed_steps:
+                # Create a plan from successful steps, renumbering them sequentially
+                # Include cached coordinates for performance optimization on future runs
+                successful_plan = Plan(
+                    task=task,
+                    steps=[
+                        PlanStep(
+                            step=i + 1,
+                            action=step.action,
+                            target_description=step.target_description,
+                            value=step.value,
+                            semantic_role=step.semantic_role,
+                            required_state=step.required_state,
+                            cached_coordinates=step.cached_coordinates,  # Cache coords for speed
+                        )
+                        for i, step in enumerate(self._executed_steps)
+                    ]
+                )
+
+                # Check if we already have a cached skill
+                existing_skill_result = self.skills_library.find_skill_with_id(task)
+
+                if existing_skill_result:
+                    skill_id, existing_plan = existing_skill_result
+                    # Update: Delete old skill and add new successful path
+                    logger.info(
+                        "updating_cached_skill",
+                        task=task,
+                        old_steps=len(existing_plan.steps),
+                        new_steps=len(successful_plan.steps)
+                    )
+                    # Delete the specific old skill
+                    self.skills_library.delete_skill(skill_id)
+                    # Add the new successful path
+                    self.skills_library.add_skill(task, successful_plan)
+                    logger.info("skill_updated", task=task)
+                else:
+                    # New skill: Just add it
+                    self.skills_library.add_skill(task, successful_plan)
+                    logger.info("skill_saved", task=task)
 
             logger.info("task_completed", task=task, success=True)
             return True
@@ -185,6 +274,17 @@ class Orchestrator:
         Returns:
             True if step succeeded, False otherwise
         """
+        # Guard: Skip all actions on blank page - will trigger re-plan with navigation
+        current_url = self.executor.get_current_url()
+        if current_url == "about:blank":
+            logger.warning(
+                "step_skipped_blank_page",
+                step=step.step,
+                action=step.action.value,
+                reason="cannot_execute_on_blank_page"
+            )
+            return False
+
         # Safety check: Skip login-related steps if storage_state was provided
         if self.config.storage_state:
             login_keywords = [
@@ -249,6 +349,16 @@ class Orchestrator:
             if coords is None:
                 return False
 
+            # Cache the coordinates for future reuse (if not already cached)
+            if not step.cached_coordinates:
+                step.cached_coordinates = coords
+                logger.debug(
+                    "caching_coordinates_for_step",
+                    step=step.step,
+                    x=coords.x,
+                    y=coords.y,
+                )
+
             # Execute action
             try:
                 await self._perform_action(step, coords)
@@ -260,8 +370,29 @@ class Orchestrator:
                 )
                 return False
 
-        # Wait for state change
-        await self.state_capturer.wait_for_change()
+        # Adaptive timeout and optional wait based on action type
+        # Navigation actions need longer waits, modal interactions are faster
+        if step.action == ActionType.NAVIGATE:
+            # Full page navigation - wait with navigation timeout
+            timeout = STATE_CHANGE_TIMEOUTS.get(step.action, 10.0)
+            await self.state_capturer.wait_for_change(timeout=timeout)
+        elif step.semantic_role == SemanticRole.NAVIGATION:
+            # Links/buttons that navigate to new pages
+            timeout = 5.0
+            await self.state_capturer.wait_for_change(timeout=timeout)
+        else:
+            # Modal/dialog/form interactions - use action-specific short timeout
+            timeout = STATE_CHANGE_TIMEOUTS.get(step.action, 3.0)
+            # Try waiting for change, but don't fail if timeout
+            changed = await self.state_capturer.wait_for_change(timeout=timeout)
+            if not changed:
+                # No visual change detected, just wait brief moment for UI update
+                logger.debug(
+                    "no_visual_change_brief_pause",
+                    step=step.step,
+                    action=step.action.value
+                )
+                await asyncio.sleep(0.5)
 
         # Capture state after action
         await self.state_capturer.capture_state(f"after_step_{step.step}")
@@ -270,7 +401,7 @@ class Orchestrator:
         return True
 
     async def _find_element(self, step: PlanStep) -> Coordinates | None:
-        """Find element using DOM-first, vision-fallback strategy.
+        """Find element using cached-coords-first, DOM, then vision-fallback strategy.
 
         Args:
             step: Step containing target description
@@ -287,6 +418,30 @@ class Orchestrator:
                 message="Cannot search for elements on blank page"
             )
             return None
+
+        # OPTIMIZATION: Try cached coordinates first (from previous successful execution)
+        if step.cached_coordinates:
+            logger.debug(
+                "trying_cached_coordinates",
+                target=step.target_description,
+                x=step.cached_coordinates.x,
+                y=step.cached_coordinates.y,
+            )
+            # Verify element still exists at cached location with quick check
+            is_valid = await self.executor.verify_element_at(step.cached_coordinates)
+            if is_valid:
+                logger.info(
+                    "element_found_by_cached_coords",
+                    target=step.target_description,
+                    x=step.cached_coordinates.x,
+                    y=step.cached_coordinates.y,
+                )
+                return step.cached_coordinates
+            else:
+                logger.debug(
+                    "cached_coords_invalid_falling_back",
+                    target=step.target_description,
+                )
 
         # DOM-first: Try to find by text
         coords = await self.executor.find_element_by_text(step.target_description)
@@ -422,6 +577,7 @@ class Orchestrator:
             "slack": "https://slack.com",
             "trello": "https://trello.com",
             "asana": "https://app.asana.com",
+            "linear": "https://linear.app",
         }
 
         # Check for each service name in task

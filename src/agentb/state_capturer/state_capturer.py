@@ -33,15 +33,24 @@ class StateCapturer:
         self._screenshots_dir.mkdir(parents=True, exist_ok=True)
         self._last_screenshot: bytes | None = None
 
-    async def capture_state(self, step_name: str) -> Path:
+    async def capture_state(self, step_name: str) -> Path | None:
         """Save current screenshot with descriptive name.
 
         Args:
             step_name: Descriptive name for this state
 
         Returns:
-            Path to the saved screenshot
+            Path to the saved screenshot, or None if page is blank
         """
+        # Skip screenshot if page is blank
+        if self.page.url == "about:blank":
+            logger.warning(
+                "screenshot_skipped_blank_page",
+                step_name=step_name,
+                url=self.page.url
+            )
+            return None
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in step_name)
         filename = f"{timestamp}_{safe_name}.png"
@@ -60,6 +69,14 @@ class StateCapturer:
         Returns:
             Screenshot as PNG bytes
         """
+        # Warn if page is blank (but still return the screenshot)
+        if self.page.url == "about:blank":
+            logger.warning(
+                "screenshot_from_blank_page",
+                url=self.page.url,
+                message="Taking screenshot of blank page - may cause vision model issues"
+            )
+
         screenshot = await self.page.screenshot()
         self._last_screenshot = screenshot
         return screenshot
@@ -69,6 +86,9 @@ class StateCapturer:
 
         Captures a 'before' screenshot, waits for network idle,
         then polls screenshots and compares using pixel difference.
+
+        Features early exit optimization: exits immediately when significant
+        change detected instead of waiting full timeout.
 
         Args:
             timeout: Max seconds to wait (uses config default if None)
@@ -83,23 +103,26 @@ class StateCapturer:
         # Capture 'before' screenshot
         before = await self.page.screenshot()
 
-        # Wait for network idle first
+        # Wait for network idle first (with shorter timeout to avoid hanging)
         try:
-            await self.page.wait_for_load_state("networkidle", timeout=timeout * 1000)
+            await self.page.wait_for_load_state("networkidle", timeout=min(timeout * 1000, 3000))
         except Exception:
             # Network idle timeout is not fatal, continue polling
             pass
 
-        # Poll for visual change
+        # Poll for visual change with adaptive polling interval
         elapsed = 0.0
+        current_poll_interval = poll_interval
+
         while elapsed < timeout:
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
+            await asyncio.sleep(current_poll_interval)
+            elapsed += current_poll_interval
 
             after = await self.page.screenshot()
             diff_ratio = self._calculate_diff(before, after)
 
             if diff_ratio > threshold:
+                # SUCCESS - State changed! Exit immediately
                 logger.info(
                     "state_change_detected",
                     diff_ratio=diff_ratio,
@@ -107,6 +130,14 @@ class StateCapturer:
                 )
                 self._last_screenshot = after
                 return True
+
+            # Adaptive polling: if very similar, slow down polling to reduce CPU
+            # This helps when waiting for slow changes
+            if diff_ratio < threshold / 10:
+                current_poll_interval = min(current_poll_interval * 1.2, 1.0)
+            else:
+                # Some change happening, poll faster
+                current_poll_interval = poll_interval
 
         logger.warning(
             "state_change_timeout",

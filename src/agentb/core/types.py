@@ -15,6 +15,15 @@ class ActionType(str, Enum):
     NAVIGATE = "NAVIGATE"
 
 
+# Adaptive timeout configuration for state changes
+STATE_CHANGE_TIMEOUTS = {
+    ActionType.NAVIGATE: 15.0,  # Pages take time to load
+    ActionType.CLICK: 3.0,      # Most clicks are instant
+    ActionType.TYPE: 2.0,       # Typing is fast
+    ActionType.SELECT: 2.0,     # Dropdowns are fast
+}
+
+
 class SemanticRole(str, Enum):
     """Semantic roles for plan steps."""
 
@@ -40,6 +49,9 @@ class PlanStep(BaseModel):
     )
     required_state: str = Field(
         ..., description="Expected UI state before this step can execute"
+    )
+    cached_coordinates: Optional["Coordinates"] = Field(
+        None, description="Cached coordinates from successful execution (for performance)"
     )
 
 

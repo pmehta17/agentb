@@ -86,6 +86,18 @@ class SkillsLibrary:
         Returns:
             Matching plan if similarity > threshold, None otherwise
         """
+        result = self.find_skill_with_id(task)
+        return result[1] if result else None
+
+    def find_skill_with_id(self, task: str) -> tuple[str, Plan] | None:
+        """Find a matching skill for a task with its ID.
+
+        Args:
+            task: Task description to match
+
+        Returns:
+            Tuple of (skill_id, plan) if similarity > threshold, None otherwise
+        """
         if self._collection.count() == 0:
             logger.debug("skills_library_empty")
             return None
@@ -94,6 +106,7 @@ class SkillsLibrary:
         embedding = self._encoder.encode(task).tolist()
 
         # Query for nearest neighbor
+        # Note: ChromaDB returns IDs by default
         results = self._collection.query(
             query_embeddings=[embedding],
             n_results=1,
@@ -110,6 +123,7 @@ class SkillsLibrary:
         similarity = 1 - distance
 
         if similarity >= self.config.skill_similarity_threshold:
+            skill_id = results["ids"][0][0]
             plan_json = results["documents"][0][0]
             plan = Plan.model_validate_json(plan_json)
             original_task = results["metadatas"][0][0]["task"]
@@ -121,7 +135,7 @@ class SkillsLibrary:
                 steps=len(plan.steps),
             )
 
-            return plan
+            return (skill_id, plan)
         else:
             logger.debug(
                 "skill_below_threshold",

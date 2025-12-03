@@ -49,6 +49,7 @@ class Planner:
     async def generate_initial_plan(
         self,
         task: str,
+        screenshot: bytes | None = None,
         current_url: str | None = None,
         is_authenticated: bool = False
     ) -> Plan:
@@ -56,6 +57,7 @@ class Planner:
 
         Args:
             task: Natural language task description
+            screenshot: Optional screenshot of current UI for vision-based planning
             current_url: Current browser URL (if available)
             is_authenticated: Whether user is already authenticated (via storage_state)
 
@@ -77,7 +79,81 @@ class Planner:
 - The user is already on their authenticated workspace/dashboard
 """
 
-        prompt = f"""You are an expert at planning browser automation tasks. Generate a step-by-step plan to accomplish the following task.
+        # Use vision-based planning if screenshot provided
+        if screenshot:
+            vision_guidance = """
+🔍 CRITICAL - SCREENSHOT PROVIDED:
+- A screenshot of the ACTUAL current UI is provided below
+- Base your plan ONLY on elements you can SEE in this screenshot
+- DO NOT hallucinate or assume UI elements that aren't visible
+- Use specific, accurate descriptions of elements you observe
+- If the task requires navigation away from this page, include a NAVIGATE step
+- Otherwise, work with the elements visible in this screenshot
+"""
+            prompt = f"""You are an expert at planning browser automation tasks. You are provided with a SCREENSHOT showing the current state of the browser.
+
+Task: {task}
+{context_info}
+{auth_info}
+{vision_guidance}
+
+Requirements:
+1. LOOK at the screenshot and identify the ACTUAL visible elements
+2. Break down the task into discrete, atomic actions using ONLY visible elements
+3. Use ONLY these action types: CLICK, TYPE, SELECT, NAVIGATE
+4. Provide clear target descriptions that match what you SEE in the screenshot
+5. Consider the logical order of operations
+6. DO NOT include navigation if already on the correct page
+7. If user is authenticated (see auth info above), NEVER include login/sign-in steps
+
+Output Format:
+Return ONLY a JSON array of steps following this schema:
+{PLAN_SCHEMA}
+
+Important:
+- Each step must be independently executable
+- target_description should be SPECIFIC and match visible elements in the screenshot
+- value is required for TYPE (text to type), SELECT (option to select), and NAVIGATE (URL to navigate to). null for CLICK actions.
+- For NAVIGATE actions, value must be a complete URL (e.g., "https://notion.so" or "https://google.com")
+- DO NOT add a NAVIGATE step if the screenshot shows you're already on the target site
+- semantic_role helps prioritize element matching
+- required_state describes what must be visible before this step
+
+Generate the plan based on what you SEE:
+"""
+            # Encode screenshot for vision model
+            image_base64 = base64.standard_b64encode(screenshot).decode("utf-8")
+
+            try:
+                response = self.client.messages.create(
+                    model=self.config.planner_model,
+                    max_tokens=2048,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": image_base64,
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": prompt,
+                                },
+                            ],
+                        }
+                    ],
+                )
+            except Exception as e:
+                logger.error("vision_plan_generation_failed", task=task, error=str(e))
+                raise
+        else:
+            # Text-only planning (original logic)
+            prompt = f"""You are an expert at planning browser automation tasks. Generate a step-by-step plan to accomplish the following task.
 
 Task: {task}
 {context_info}
@@ -108,19 +184,36 @@ Important:
 Generate the plan:
 """
 
-        try:
-            response = self.client.messages.create(
-                model=self.config.planner_model,
-                max_tokens=2048,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
+            try:
+                response = self.client.messages.create(
+                    model=self.config.planner_model,
+                    max_tokens=2048,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ],
+                )
+            except Exception as e:
+                logger.error("plan_generation_failed", task=task, error=str(e))
+                raise
+
+        # Parse response (common for both vision and text-only)
+        response_text = response.content[0].text
+        steps = self._parse_plan_response(response_text)
+
+        plan = Plan(task=task, steps=steps)
+
+        # Log differently for vision vs text-only planning
+        if screenshot:
+            logger.info(
+                "vision_plan_generated",
+                task=task,
+                steps=len(steps),
+                step_list=[
+                    f"Step {s.step}: {s.action.value} - {s.target_description}"
+                    for s in steps
+                ]
             )
-
-            response_text = response.content[0].text
-            steps = self._parse_plan_response(response_text)
-
-            plan = Plan(task=task, steps=steps)
+        else:
             logger.info(
                 "plan_generated",
                 task=task,
@@ -131,11 +224,7 @@ Generate the plan:
                 ]
             )
 
-            return plan
-
-        except Exception as e:
-            logger.error("plan_generation_failed", task=task, error=str(e))
-            raise
+        return plan
 
     async def regenerate_plan(self, context: ContextBundle) -> Plan:
         """Regenerate plan using failure context with visual awareness.
